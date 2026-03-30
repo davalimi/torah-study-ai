@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Data
+data/
+
+# Environment
+.env
+
+# Build
+dist/
+.next/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Claude
+CLAUDE.md
+**/CLAUDE.md
+.claude/
+**/.claude/
+
+# Python
+*.egg-info/
+*.egg
