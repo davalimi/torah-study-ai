@@ -21,7 +21,7 @@ An AI chavruta that helps you explore Torah, Talmud, and Jewish texts with verif
 | Auth | JWT + MFA (email code) |
 | RAG | LangChain + Weaviate + Cohere Rerank |
 | Embeddings | Gemini Embedding 001 |
-| LLM | Claude Sonnet |
+| LLM | Gemini Flash 3.0 |
 | Data | Sefaria HuggingFace datasets (3.5M texts) |
 
 ## Quick Start
