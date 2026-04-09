@@ -13,6 +13,8 @@ from google.genai import types
 
 COLLECTION_NAME = "SefariaTexts"
 
+RELEVANCE_THRESHOLD = 0.3  # Cohere rerank score below this = not relevant enough
+
 SYSTEM_PROMPT = """You are a chavruta (Torah study partner), NOT a rabbi. Never claim to be a rabbi or a halakhic authority.
 
 Your users are beginners: ba'alei teshuva, French-speaking olim, traditional Jews who never studied texts formally. Explain like you're talking to a curious friend over coffee.
@@ -21,12 +23,24 @@ Your users are beginners: ba'alei teshuva, French-speaking olim, traditional Jew
 
 1. Answer ONLY based on the sources provided below. Do not use your general knowledge.
 2. For each claim, cite the source reference with its Sefaria link.
-3. If the sources don't contain relevant information, say: "I didn't find this text in my library yet. Try asking about a different topic or check directly on sefaria.org."
-4. For ANY practical halakhic question, add at the end: "This is for learning purposes only. Please consult your Rabbi for a practical ruling."
-5. Answer in the same language the user writes in.
-6. When quoting Hebrew texts, provide the original Hebrew AND a translation in the user's language.
-7. Give detailed explanations of the sources you have. Be a real study partner.
-8. At the end, list the sources you used with their Sefaria links.
+3. For ANY practical halakhic question, add at the end: "This is for learning purposes only. Please consult your Rabbi for a practical ruling."
+4. Answer in the same language the user writes in.
+5. When quoting Hebrew texts, provide the original Hebrew AND a translation in the user's language.
+6. Give detailed explanations of the sources you have. Be a real study partner.
+7. At the end, list the sources you used with their Sefaria links.
+"""
+
+FALLBACK_PROMPT = """You are a chavruta (Torah study partner). The user asked a question but the relevant sources were not found in the library.
+
+Your job is to:
+1. Acknowledge that you don't have the exact text in your library yet
+2. Build a direct Sefaria link for what they're looking for (use the format https://www.sefaria.org/REFERENCE)
+3. Suggest 3 related topics from the sources you DO have (listed below)
+4. Answer in the same language the user writes in
+5. Be warm and helpful, like a study partner who says "I don't have that book on my shelf, but here's where to find it and here's what I can help you with"
+
+Available sources you can suggest (these are texts you DO have):
+{suggestions}
 """
 
 
@@ -119,6 +133,52 @@ def build_context(sources: list[Source]) -> str:
     return "\n\n".join(parts)
 
 
+def has_relevant_sources(ranked: list[Source]) -> bool:
+    """Check if the top reranked source is relevant enough."""
+    if not ranked:
+        return False
+    return ranked[0].score >= RELEVANCE_THRESHOLD
+
+
+def build_suggestions(sources: list[Source]) -> str:
+    """Build a list of available sources to suggest."""
+    seen = set()
+    suggestions = []
+    for s in sources:
+        if s.ref not in seen and len(suggestions) < 5:
+            seen.add(s.ref)
+            suggestions.append(f"- {s.ref} ({s.category}) - {s.url}")
+    return "\n".join(suggestions)
+
+
+def _generate(
+    gemini_client: genai.Client,
+    system: str,
+    prompt: str,
+) -> str:
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        config=types.GenerateContentConfig(system_instruction=system),
+        contents=prompt,
+    )
+    return response.text
+
+
+def _stream(
+    gemini_client: genai.Client,
+    system: str,
+    prompt: str,
+) -> Generator[str, None, None]:
+    response = gemini_client.models.generate_content_stream(
+        model="gemini-2.5-flash",
+        config=types.GenerateContentConfig(system_instruction=system),
+        contents=prompt,
+    )
+    for chunk in response:
+        if chunk.text:
+            yield chunk.text
+
+
 def ask_with_rag(
     question: str,
     gemini_client: genai.Client,
@@ -128,22 +188,16 @@ def ask_with_rag(
     """Full RAG pipeline: search -> rerank -> generate."""
     sources = search(question, gemini_client, wv_client, k=20)
     ranked = rerank(question, sources, cohere_client, top_n=5)
-    context = build_context(ranked)
 
-    prompt = f"""Here are the relevant Torah sources:
+    if has_relevant_sources(ranked):
+        context = build_context(ranked)
+        prompt = f"Here are the relevant Torah sources:\n\n{context}\n\nQuestion: {question}"
+        return _generate(gemini_client, SYSTEM_PROMPT, prompt)
 
-{context}
-
-Question: {question}"""
-
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-        ),
-        contents=prompt,
-    )
-    return response.text
+    # Fallback: suggest related topics
+    suggestions = build_suggestions(sources)
+    system = FALLBACK_PROMPT.format(suggestions=suggestions)
+    return _generate(gemini_client, system, question)
 
 
 def stream_with_rag(
@@ -155,21 +209,13 @@ def stream_with_rag(
     """Full RAG pipeline with streaming: search -> rerank -> stream generation."""
     sources = search(question, gemini_client, wv_client, k=20)
     ranked = rerank(question, sources, cohere_client, top_n=5)
-    context = build_context(ranked)
 
-    prompt = f"""Here are the relevant Torah sources:
-
-{context}
-
-Question: {question}"""
-
-    response = gemini_client.models.generate_content_stream(
-        model="gemini-2.5-flash",
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-        ),
-        contents=prompt,
-    )
-    for chunk in response:
-        if chunk.text:
-            yield chunk.text
+    if has_relevant_sources(ranked):
+        context = build_context(ranked)
+        prompt = f"Here are the relevant Torah sources:\n\n{context}\n\nQuestion: {question}"
+        yield from _stream(gemini_client, SYSTEM_PROMPT, prompt)
+    else:
+        # Fallback: suggest related topics
+        suggestions = build_suggestions(sources)
+        system = FALLBACK_PROMPT.format(suggestions=suggestions)
+        yield from _stream(gemini_client, system, question)
