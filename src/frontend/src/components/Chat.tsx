@@ -26,12 +26,16 @@ export default function Chat({
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [currentSessionId, setCurrentSessionId] = useState<number | null>(sessionId);
+  const isChattingRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    setMessages(initialMessages);
-    setCurrentSessionId(sessionId);
+    // Only reset messages when user clicks a session in sidebar, not during active chat
+    if (!isChattingRef.current) {
+      setMessages(initialMessages);
+      setCurrentSessionId(sessionId);
+    }
   }, [sessionId, initialMessages]);
 
   useEffect(() => {
@@ -70,6 +74,7 @@ export default function Chat({
     setLoading(true);
 
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+    isChattingRef.current = true;
 
     try {
       const sid = await ensureSession();
@@ -126,10 +131,11 @@ export default function Chat({
         await addMessage(token, sid, "assistant", fullAnswer);
       }
     } catch (error) {
+      console.error("Chat error:", error);
       setMessages((prev) => {
         const updated = [...prev];
         const last = updated[updated.length - 1];
-        if (last && last.role === "assistant" && last.content === "") {
+        if (last && last.role === "assistant") {
           updated[updated.length - 1] = {
             ...last,
             content:
@@ -142,6 +148,7 @@ export default function Chat({
       });
     } finally {
       setLoading(false);
+      isChattingRef.current = false;
       inputRef.current?.focus();
     }
   }
@@ -164,7 +171,7 @@ export default function Chat({
             </div>
           )}
 
-          {messages.map((message, i) => (
+          {messages.filter((m) => m.content !== "").map((message, i) => (
             <div
               key={i}
               className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
