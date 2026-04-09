@@ -3,20 +3,20 @@ services:
   frontend:
     build: ./src/frontend
     ports:
-      - "5173:5173"
+      - "3000:3000"
     depends_on:
       - api
     environment:
-      VITE_API_URL: http://localhost:8000
+      NEXT_PUBLIC_API_URL: http://localhost:8000
 
   api:
-    build: ./src/api
+    build:
+      context: .
+      dockerfile: src/api/Dockerfile
     ports:
       - "8000:8000"
-    depends_on:
-      - weaviate
     volumes:
-      - ./data/db:/app/db
+      - ./data/db:/app/data
     env_file:
       - .env
 
