@@ -1,20 +1,37 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import { addMessage, API_URL } from "@/lib/api";
 
 interface Message {
   role: "user" | "assistant";
   content: string;
 }
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+interface ChatProps {
+  token: string;
+  sessionId: number | null;
+  initialMessages?: Message[];
+  onSessionCreated?: (id: number) => void;
+}
 
-export default function Chat() {
-  const [messages, setMessages] = useState<Message[]>([]);
+export default function Chat({
+  token,
+  sessionId,
+  initialMessages = [],
+  onSessionCreated,
+}: ChatProps) {
+  const [messages, setMessages] = useState<Message[]>(initialMessages);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [currentSessionId, setCurrentSessionId] = useState<number | null>(sessionId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setMessages(initialMessages);
+    setCurrentSessionId(sessionId);
+  }, [sessionId, initialMessages]);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -24,7 +41,23 @@ export default function Chat() {
 
   useEffect(() => {
     inputRef.current?.focus();
-  }, []);
+  }, [sessionId]);
+
+  async function ensureSession(): Promise<number> {
+    if (currentSessionId) return currentSessionId;
+
+    const response = await fetch(`${API_URL}/sessions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    const data = await response.json();
+    setCurrentSessionId(data.id);
+    onSessionCreated?.(data.id);
+    return data.id;
+  }
 
   async function handleSend() {
     const question = input.trim();
@@ -38,6 +71,11 @@ export default function Chat() {
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
     try {
+      const sid = await ensureSession();
+
+      // Save user message
+      await addMessage(token, sid, "user", question);
+
       const response = await fetch(`${API_URL}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -54,6 +92,8 @@ export default function Chat() {
 
       if (!reader) throw new Error("No response body");
 
+      let fullAnswer = "";
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -64,6 +104,7 @@ export default function Chat() {
         for (const line of lines) {
           if (line.startsWith("data: ") && line !== "data: [DONE]") {
             const chunk = line.slice(6);
+            fullAnswer += chunk;
             setMessages((prev) => {
               const updated = [...prev];
               const last = updated[updated.length - 1];
@@ -77,6 +118,11 @@ export default function Chat() {
             });
           }
         }
+      }
+
+      // Save assistant message
+      if (fullAnswer) {
+        await addMessage(token, sid, "assistant", fullAnswer);
       }
     } catch (error) {
       setMessages((prev) => {
@@ -101,7 +147,6 @@ export default function Chat() {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Messages area */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-6">
         <div className="max-w-2xl mx-auto space-y-6">
           {messages.length === 0 && (
@@ -151,7 +196,6 @@ export default function Chat() {
         </div>
       </div>
 
-      {/* Input area */}
       <div className="border-t border-[var(--border)] bg-[var(--background)] px-4 py-4">
         <form
           onSubmit={(e) => {
