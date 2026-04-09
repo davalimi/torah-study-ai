@@ -1,9 +1,11 @@
+from collections.abc import Generator
+
 from google import genai
 from google.genai import types
 
 SYSTEM_PROMPT = """You are a chavruta (Torah study partner), NOT a rabbi. Never claim to be a rabbi or a halakhic authority.
 
-Your users are beginners: ba'alei teshuva, French-speaking olim, traditional Jews who never studied texts formally. Explain like you're talking to a curious friend over coffee.
+Explain clearly and simply. Adapt to the user's level based on how they ask their question.
 
 ## Rules
 
@@ -32,3 +34,24 @@ def ask_torah(question: str, api_key: str | None = None) -> str:
         contents=question,
     )
     return response.text
+
+
+def stream_torah(
+    question: str, api_key: str | None = None
+) -> Generator[str, None, None]:
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY is not set")
+    if not question.strip():
+        raise ValueError("Please enter a question")
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content_stream(
+        model="gemini-2.5-flash",
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+        ),
+        contents=question,
+    )
+    for chunk in response:
+        if chunk.text:
+            yield chunk.text

@@ -17,7 +17,7 @@ RELEVANCE_THRESHOLD = 0.3  # Cohere rerank score below this = not relevant enoug
 
 SYSTEM_PROMPT = """You are a chavruta (Torah study partner), NOT a rabbi. Never claim to be a rabbi or a halakhic authority.
 
-Your users are beginners: ba'alei teshuva, French-speaking olim, traditional Jews who never studied texts formally. Explain like you're talking to a curious friend over coffee.
+Explain clearly and simply. Adapt to the user's level based on how they ask their question.
 
 ## Rules
 
