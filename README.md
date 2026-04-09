@@ -15,13 +15,13 @@ An AI chavruta that helps you explore Torah, Talmud, and Jewish texts with verif
 
 | Layer | Technology |
 |-------|-----------|
-| Frontend | React + Vite + shadcn/ui |
+| Frontend | Next.js + shadcn/ui |
 | Backend | FastAPI (Python) |
 | Database | SQLite |
-| Auth | JWT + MFA (email code) |
+| Auth | JWT + bcrypt |
 | RAG | LangChain + Weaviate + Cohere Rerank |
 | Embeddings | Gemini Embedding 001 |
-| LLM | Gemini Flash 3.0 |
+| LLM | Gemini 2.5 Flash |
 | Data | Sefaria HuggingFace datasets (3.5M texts) |
 
 ## Quick Start
@@ -33,26 +33,30 @@ cd torah-study-ai
 
 # Set up environment
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env with your GOOGLE_API_KEY
 
-# Run everything
-docker compose up
+# Install
+make install
+make install-frontend
+
+# Run (2 terminals)
+make api        # Terminal 1: API on localhost:8000
+make frontend   # Terminal 2: Frontend on localhost:3000
 ```
 
-Open http://localhost:5173
+Open http://localhost:3000
 
 ## Project Structure
 
 ```
 torah-study-ai/
   src/
-    api/          # FastAPI backend
-    rag/          # LangChain RAG pipeline
-    frontend/     # React + Vite + shadcn/ui
+    api/          # FastAPI backend (auth, chat, sessions)
+    frontend/     # Next.js + shadcn/ui
+    rag/          # LangChain RAG pipeline (Block 3)
   scripts/        # Download Sefaria, indexing, evaluation
-  tests/
-  data/           # Local data (gitignored)
-  docs/           # Design docs
+  tests/          # pytest (18 tests)
+  data/           # SQLite DB + local data (gitignored)
 ```
 
 ## Documentation
