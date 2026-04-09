@@ -5,10 +5,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import os
+import weaviate
+
+import cohere
+from google import genai
 
 from src.api.torah import ask_torah, stream_torah
 from src.api.db import init_db, get_connection
 from src.api.auth import hash_password, verify_password, create_token, get_current_user_id
+from src.rag.pipeline import get_weaviate_client, stream_with_rag
 
 app = FastAPI(title="Torah Study AI")
 
@@ -19,10 +24,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Shared clients (initialized on startup)
+wv_client: weaviate.WeaviateClient | None = None
+gemini_client: genai.Client | None = None
+cohere_client: cohere.Client | None = None
+
 
 @app.on_event("startup")
 def startup() -> None:
+    global wv_client, gemini_client, cohere_client
     init_db()
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    cohere_key = os.environ.get("COHERE_API_KEY")
+
+    if api_key:
+        gemini_client = genai.Client(api_key=api_key)
+    if cohere_key:
+        cohere_client = cohere.Client(api_key=cohere_key)
+
+    try:
+        wv_client = get_weaviate_client()
+    except Exception:
+        pass  # RAG not available, fallback to direct LLM
 
 
 # --- Models ---
@@ -192,22 +216,27 @@ def chat(request_body: ChatRequest) -> ChatResponse:
     return ChatResponse(answer=answer)
 
 
-def _sse_generator(question: str, api_key: str) -> Generator[str, None, None]:
-    for chunk in stream_torah(question, api_key=api_key):
-        yield f"data: {chunk}\n\n"
+def _sse_generator(question: str) -> Generator[str, None, None]:
+    # Use RAG if all clients are available, otherwise fallback to direct LLM
+    if wv_client and gemini_client and cohere_client:
+        for chunk in stream_with_rag(question, gemini_client, wv_client, cohere_client):
+            yield f"data: {chunk}\n\n"
+    else:
+        api_key = os.environ.get("GOOGLE_API_KEY", "")
+        for chunk in stream_torah(question, api_key=api_key):
+            yield f"data: {chunk}\n\n"
     yield "data: [DONE]\n\n"
 
 
 @app.post("/chat/stream")
 def chat_stream(request_body: ChatRequest) -> StreamingResponse:
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
+    if not gemini_client:
         raise HTTPException(status_code=500, detail="GOOGLE_API_KEY is not set")
 
     if not request_body.question.strip():
         raise HTTPException(status_code=400, detail="Please enter a question")
 
     return StreamingResponse(
-        _sse_generator(request_body.question, api_key),
+        _sse_generator(request_body.question),
         media_type="text/event-stream",
     )
