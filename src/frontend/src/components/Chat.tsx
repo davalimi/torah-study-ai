@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
 import { addMessage, API_URL } from "@/lib/api";
 
 interface Message {
@@ -175,9 +176,30 @@ export default function Chat({
                     : "bg-[var(--card)] border border-[var(--border)] shadow-sm"
                 }`}
               >
-                <p className="text-[15px] leading-relaxed whitespace-pre-wrap">
-                  {message.content}
-                </p>
+                {message.role === "user" ? (
+                  <p className="text-[15px] leading-relaxed whitespace-pre-wrap">
+                    {message.content}
+                  </p>
+                ) : (
+                  <div className="text-[15px] leading-relaxed prose prose-sm max-w-none break-words prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5 prose-a:text-[var(--accent)] prose-a:underline prose-strong:font-semibold">
+                    <ReactMarkdown
+                      components={{
+                        a: ({ href, children }) => (
+                          <a
+                            href={href}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-[var(--accent)] underline break-all hover:opacity-80"
+                          >
+                            {children}
+                          </a>
+                        ),
+                      }}
+                    >
+                      {message.content}
+                    </ReactMarkdown>
+                  </div>
+                )}
               </div>
             </div>
           ))}
