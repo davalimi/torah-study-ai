@@ -1,4 +1,4 @@
-.PHONY: test test-unit test-all install dev clean
+.PHONY: test test-all install install-frontend api frontend clean
 
 # Run unit tests only (no API calls)
 test:
@@ -8,14 +8,22 @@ test:
 test-all:
 	source .venv/bin/activate && set -a && source .env && set +a && python -m pytest tests/ -v
 
-# Install dependencies
+# Install Python dependencies
 install:
 	python3 -m venv .venv
 	source .venv/bin/activate && pip install -r requirements.txt
 
-# Run the script manually
-dev:
-	source .venv/bin/activate && set -a && source .env && set +a && python -m src.api.torah
+# Install frontend dependencies
+install-frontend:
+	cd src/frontend && npm install
+
+# Run the API server
+api:
+	source .venv/bin/activate && set -a && source .env && set +a && uvicorn src.api.main:app --reload --port 8000
+
+# Run the frontend
+frontend:
+	cd src/frontend && npm run dev
 
 # Remove venv and cache
 clean:
