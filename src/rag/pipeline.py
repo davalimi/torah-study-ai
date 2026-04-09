@@ -137,10 +137,10 @@ def rerank(query: str, sources: list[Source], cohere_client: cohere.Client, top_
 
 
 def build_context(sources: list[Source]) -> str:
-    """Build context string from sources for the LLM prompt."""
+    """Build context string from sources for the LLM prompt. No URLs - just ref and text."""
     parts = []
     for i, s in enumerate(sources, 1):
-        parts.append(f"[Source {i}] {s.ref} ({s.category}, {s.lang})\n{s.text}\nLink: {s.url}")
+        parts.append(f"[Source {i}] {s.ref}\n{s.text}")
     return "\n\n".join(parts)
 
 
