@@ -16,6 +16,16 @@ interface ChatProps {
   onSessionCreated?: (id: number) => void;
 }
 
+// Extract text content from React children (for section detection)
+function getTextContent(children: React.ReactNode): string {
+  if (typeof children === "string") return children;
+  if (Array.isArray(children)) return children.map(getTextContent).join("");
+  if (children && typeof children === "object" && "props" in children) {
+    return getTextContent((children as React.ReactElement<{ children?: React.ReactNode }>).props.children);
+  }
+  return "";
+}
+
 // Transform Sefaria references in text to clickable links.
 // Matches patterns like: Berakhot 17b:13, Genesis 1:1, Rashi on Exodus 20:8
 function linkifyReferences(text: string): string {
@@ -174,14 +184,52 @@ export default function Chat({
     h2: ({ children }: { children?: React.ReactNode }) => (
       <h2 className="text-xl font-bold mt-6 mb-3 text-[var(--foreground)]">{children}</h2>
     ),
-    h3: ({ children }: { children?: React.ReactNode }) => (
-      <h3 className="text-lg font-semibold mt-6 mb-3 text-[var(--foreground)] border-b border-[var(--border)] pb-2">
-        {children}
-      </h3>
-    ),
-    p: ({ children }: { children?: React.ReactNode }) => (
-      <p className="mb-4 leading-7 text-[var(--foreground)]">{children}</p>
-    ),
+    h3: ({ children }: { children?: React.ReactNode }) => {
+      const text = getTextContent(children);
+
+      if (text.includes("TL;DR")) {
+        return (
+          <div className="tldr-heading mt-2 mb-2">
+            <span className="text-xs font-semibold uppercase tracking-wide text-[var(--accent)]">
+              Key Takeaway
+            </span>
+          </div>
+        );
+      }
+
+      if (text.includes("Sources") || text.includes("Explanation")) {
+        return (
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted-foreground)] mt-8 mb-3">
+            {children}
+          </h3>
+        );
+      }
+
+      return (
+        <h3 className="text-lg font-semibold mt-6 mb-3 text-[var(--foreground)]">
+          {children}
+        </h3>
+      );
+    },
+    p: ({ children }: { children?: React.ReactNode }) => {
+      const text = getTextContent(children);
+      const isDisclaimer =
+        text.includes("consult your Rabbi") ||
+        text.includes("learning purposes only");
+
+      if (isDisclaimer) {
+        return (
+          <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <span className="font-semibold">Note: </span>
+            <span className="italic">{children}</span>
+          </div>
+        );
+      }
+
+      return (
+        <p className="mb-4 leading-7 text-[var(--foreground)]">{children}</p>
+      );
+    },
     ul: ({ children }: { children?: React.ReactNode }) => (
       <ul className="list-disc pl-6 mb-4 space-y-2 marker:text-[var(--accent)]">{children}</ul>
     ),
@@ -195,20 +243,20 @@ export default function Chat({
       <strong className="font-bold text-[var(--foreground)]">{children}</strong>
     ),
     em: ({ children }: { children?: React.ReactNode }) => (
-      <em className="italic text-[var(--muted-foreground)]">{children}</em>
+      <em className="italic text-[var(--foreground)]">{children}</em>
     ),
     a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
       <a
         href={href}
         target="_blank"
         rel="noopener noreferrer"
-        className="text-[var(--accent)] font-medium underline underline-offset-2 hover:opacity-80 transition-opacity"
+        className="text-[var(--accent)] text-[13px] no-underline hover:underline opacity-70 hover:opacity-100 transition-opacity"
       >
         {children}
       </a>
     ),
     blockquote: ({ children }: { children?: React.ReactNode }) => (
-      <blockquote className="border-l-4 border-[var(--accent)] pl-4 my-4 italic text-[var(--muted-foreground)]">
+      <blockquote className="border-l-4 border-[var(--accent)] pl-4 my-4 italic text-[var(--foreground)]">
         {children}
       </blockquote>
     ),

@@ -129,3 +129,15 @@
     @apply font-sans;
   }
 }
+
+/* TL;DR callout: style the paragraph following the TL;DR heading */
+.tldr-heading + p {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-left: 4px solid var(--accent);
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-top: -4px;
+  margin-bottom: 28px;
+  font-weight: 500;
+  line-height: 1.75;
+}
