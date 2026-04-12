@@ -16,6 +16,17 @@ interface ChatProps {
   onSessionCreated?: (id: number) => void;
 }
 
+// Transform Sefaria references in text to clickable links.
+// Matches patterns like: Berakhot 17b:13, Genesis 1:1, Rashi on Exodus 20:8
+function linkifyReferences(text: string): string {
+  const refPattern = /\(([A-Z][A-Za-z\s]+(?:\s\d+[ab]?:?\d*(?::\d+)?))\)/g;
+  return text.replace(refPattern, (match, ref) => {
+    const slug = ref.trim().replace(/\s+/g, "_").replace(/:/g, ".");
+    const url = `https://www.sefaria.org/${slug}`;
+    return `([${ref}](${url}))`;
+  });
+}
+
 export default function Chat({
   token,
   sessionId,
@@ -31,7 +42,6 @@ export default function Chat({
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    // Only reset messages when user clicks a session in sidebar, not during active chat
     if (!isChattingRef.current) {
       setMessages(initialMessages);
       setCurrentSessionId(sessionId);
@@ -79,7 +89,6 @@ export default function Chat({
     try {
       const sid = await ensureSession();
 
-      // Save user message
       await addMessage(token, sid, "user", question);
 
       const response = await fetch(`${API_URL}/chat/stream`, {
@@ -109,24 +118,29 @@ export default function Chat({
 
         for (const line of lines) {
           if (line.startsWith("data: ") && line !== "data: [DONE]") {
-            const chunk = line.slice(6);
-            fullAnswer += chunk;
-            setMessages((prev) => {
-              const updated = [...prev];
-              const last = updated[updated.length - 1];
-              if (last && last.role === "assistant") {
-                updated[updated.length - 1] = {
-                  ...last,
-                  content: last.content + chunk,
-                };
-              }
-              return updated;
-            });
+            const payload = line.slice(6);
+            try {
+              const parsed = JSON.parse(payload);
+              const chunk = parsed.text || "";
+              fullAnswer += chunk;
+              setMessages((prev) => {
+                const updated = [...prev];
+                const last = updated[updated.length - 1];
+                if (last && last.role === "assistant") {
+                  updated[updated.length - 1] = {
+                    ...last,
+                    content: last.content + chunk,
+                  };
+                }
+                return updated;
+              });
+            } catch {
+              // Ignore malformed SSE lines
+            }
           }
         }
       }
 
-      // Save assistant message
       if (fullAnswer) {
         await addMessage(token, sid, "assistant", fullAnswer);
       }
@@ -153,10 +167,63 @@ export default function Chat({
     }
   }
 
+  const markdownComponents = {
+    h1: ({ children }: { children?: React.ReactNode }) => (
+      <h1 className="text-2xl font-bold mt-8 mb-4 text-[var(--foreground)]">{children}</h1>
+    ),
+    h2: ({ children }: { children?: React.ReactNode }) => (
+      <h2 className="text-xl font-bold mt-6 mb-3 text-[var(--foreground)]">{children}</h2>
+    ),
+    h3: ({ children }: { children?: React.ReactNode }) => (
+      <h3 className="text-lg font-semibold mt-6 mb-3 text-[var(--foreground)] border-b border-[var(--border)] pb-2">
+        {children}
+      </h3>
+    ),
+    p: ({ children }: { children?: React.ReactNode }) => (
+      <p className="mb-4 leading-7 text-[var(--foreground)]">{children}</p>
+    ),
+    ul: ({ children }: { children?: React.ReactNode }) => (
+      <ul className="list-disc pl-6 mb-4 space-y-2 marker:text-[var(--accent)]">{children}</ul>
+    ),
+    ol: ({ children }: { children?: React.ReactNode }) => (
+      <ol className="list-decimal pl-6 mb-4 space-y-2">{children}</ol>
+    ),
+    li: ({ children }: { children?: React.ReactNode }) => (
+      <li className="leading-7 text-[var(--foreground)]">{children}</li>
+    ),
+    strong: ({ children }: { children?: React.ReactNode }) => (
+      <strong className="font-bold text-[var(--foreground)]">{children}</strong>
+    ),
+    em: ({ children }: { children?: React.ReactNode }) => (
+      <em className="italic text-[var(--muted-foreground)]">{children}</em>
+    ),
+    a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
+      <a
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-[var(--accent)] font-medium underline underline-offset-2 hover:opacity-80 transition-opacity"
+      >
+        {children}
+      </a>
+    ),
+    blockquote: ({ children }: { children?: React.ReactNode }) => (
+      <blockquote className="border-l-4 border-[var(--accent)] pl-4 my-4 italic text-[var(--muted-foreground)]">
+        {children}
+      </blockquote>
+    ),
+    code: ({ children }: { children?: React.ReactNode }) => (
+      <code className="bg-[var(--muted)] px-1.5 py-0.5 rounded text-sm font-mono">
+        {children}
+      </code>
+    ),
+    hr: () => <hr className="my-6 border-[var(--border)]" />,
+  };
+
   return (
     <div className="flex flex-col h-full">
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-6">
-        <div className="max-w-2xl mx-auto space-y-6">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-8">
+        <div className="max-w-4xl mx-auto space-y-8">
           {messages.length === 0 && (
             <div className="flex flex-col items-center justify-center h-full min-h-[60vh] text-center">
               <h2
@@ -171,49 +238,35 @@ export default function Chat({
             </div>
           )}
 
-          {messages.filter((m) => m.content !== "").map((message, i) => (
-            <div
-              key={i}
-              className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
-            >
-              <div
-                className={`max-w-[85%] rounded-2xl px-5 py-3.5 ${
-                  message.role === "user"
-                    ? "bg-[var(--primary)] text-[var(--primary-foreground)]"
-                    : "bg-[var(--card)] border border-[var(--border)] shadow-sm"
-                }`}
-              >
-                {message.role === "user" ? (
-                  <p className="text-[15px] leading-relaxed whitespace-pre-wrap">
-                    {message.content}
-                  </p>
-                ) : (
-                  <div className="text-[15px] leading-relaxed prose prose-sm max-w-none break-words prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5 prose-a:text-[var(--accent)] prose-a:underline prose-strong:font-semibold">
-                    <ReactMarkdown
-                      components={{
-                        a: ({ href, children }) => (
-                          <a
-                            href={href}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-[var(--accent)] underline break-all hover:opacity-80"
-                          >
-                            {children}
-                          </a>
-                        ),
-                      }}
-                    >
+          {messages.filter((m) => m.content !== "").map((message, i) => {
+            if (message.role === "user") {
+              return (
+                <div key={i} className="flex justify-end">
+                  <div className="max-w-[75%] rounded-2xl px-5 py-3 bg-[var(--primary)] text-[var(--primary-foreground)]">
+                    <p className="text-[15px] leading-relaxed whitespace-pre-wrap">
                       {message.content}
-                    </ReactMarkdown>
+                    </p>
                   </div>
-                )}
+                </div>
+              );
+            }
+
+            // Assistant messages: full width, no bubble
+            const linkedContent = linkifyReferences(message.content);
+            return (
+              <div key={i} className="w-full">
+                <div className="text-[15px]">
+                  <ReactMarkdown components={markdownComponents}>
+                    {linkedContent}
+                  </ReactMarkdown>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
 
           {loading && messages[messages.length - 1]?.content === "" && (
             <div className="flex justify-start">
-              <div className="bg-[var(--card)] border border-[var(--border)] shadow-sm rounded-2xl px-5 py-3.5">
+              <div className="py-2">
                 <div className="flex gap-1.5">
                   <span className="w-2 h-2 bg-[var(--accent)] rounded-full animate-bounce [animation-delay:-0.3s]" />
                   <span className="w-2 h-2 bg-[var(--accent)] rounded-full animate-bounce [animation-delay:-0.15s]" />
@@ -225,13 +278,13 @@ export default function Chat({
         </div>
       </div>
 
-      <div className="border-t border-[var(--border)] bg-[var(--background)] px-4 py-4">
+      <div className="border-t border-[var(--border)] bg-[var(--background)] px-6 py-4">
         <form
           onSubmit={(e) => {
             e.preventDefault();
             handleSend();
           }}
-          className="max-w-2xl mx-auto flex gap-3"
+          className="max-w-4xl mx-auto flex gap-3"
         >
           <input
             ref={inputRef}

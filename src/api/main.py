@@ -217,14 +217,20 @@ def chat(request_body: ChatRequest) -> ChatResponse:
 
 
 def _sse_generator(question: str) -> Generator[str, None, None]:
+    """SSE generator. Encodes chunks as JSON to preserve newlines."""
+    import json
+
     # Use RAG if all clients are available, otherwise fallback to direct LLM
     if wv_client and gemini_client and cohere_client:
-        for chunk in stream_with_rag(question, gemini_client, wv_client, cohere_client):
-            yield f"data: {chunk}\n\n"
+        stream = stream_with_rag(question, gemini_client, wv_client, cohere_client)
     else:
         api_key = os.environ.get("GOOGLE_API_KEY", "")
-        for chunk in stream_torah(question, api_key=api_key):
-            yield f"data: {chunk}\n\n"
+        stream = stream_torah(question, api_key=api_key)
+
+    for chunk in stream:
+        # JSON-encode to preserve newlines and special characters
+        payload = json.dumps({"text": chunk})
+        yield f"data: {payload}\n\n"
     yield "data: [DONE]\n\n"
 
 

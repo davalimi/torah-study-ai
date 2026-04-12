@@ -1,9 +1,12 @@
-"""Embed Sefaria texts with Gemini and index them in Weaviate."""
+"""Embed Sefaria texts with Gemini and index them in Weaviate. Fast parallel version."""
 
 import base64
 import os
 import time
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+from threading import Thread
 
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType
@@ -11,8 +14,9 @@ from datasets import load_dataset
 from google import genai
 
 
-BATCH_SIZE = 100
-PAUSE_BETWEEN_BATCHES = 0  # Gemini allows 1500 req/min, no pause needed
+EMBED_BATCH_SIZE = 100  # Max per Gemini API call
+EMBED_WORKERS = 15      # Parallel embedding threads
+WV_BATCH_SIZE = 500     # Weaviate batch insert size
 COLLECTION_NAME = "SefariaTexts"
 
 
@@ -36,7 +40,7 @@ def get_weaviate_client() -> weaviate.WeaviateClient:
 
 def create_collection(client: weaviate.WeaviateClient) -> None:
     if client.collections.exists(COLLECTION_NAME):
-        print(f"Collection '{COLLECTION_NAME}' already exists. Skipping creation.")
+        print(f"Collection '{COLLECTION_NAME}' exists. Resuming.")
         return
 
     client.collections.create(
@@ -54,97 +58,169 @@ def create_collection(client: weaviate.WeaviateClient) -> None:
     print(f"Created collection '{COLLECTION_NAME}'")
 
 
-def embed_batch(gemini_client: genai.Client, texts: list[str]) -> list[list[float]]:
-    result = gemini_client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=texts,
-    )
-    return [e.values for e in result.embeddings]
+def embed_with_retry(gemini_client: genai.Client, texts: list[str], max_retries: int = 5) -> list[list[float]]:
+    for attempt in range(max_retries):
+        try:
+            result = gemini_client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=texts,
+            )
+            return [e.values for e in result.embeddings]
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = min(2 ** attempt + 2, 30)
+                time.sleep(wait)
+            elif attempt < max_retries - 1:
+                time.sleep(1)
+            else:
+                return []
+    return []
+
+
+def weaviate_writer(wv_client: weaviate.WeaviateClient, queue: Queue, stats: dict) -> None:
+    """Background thread that writes to Weaviate from the queue."""
+    collection = wv_client.collections.get(COLLECTION_NAME)
+    buffer = []
+
+    while True:
+        item = queue.get()
+        if item is None:
+            break
+
+        buffer.extend(item)
+
+        if len(buffer) >= WV_BATCH_SIZE:
+            try:
+                with collection.batch.fixed_size(batch_size=len(buffer)) as batch:
+                    for obj in buffer:
+                        batch.add_object(properties=obj["properties"], vector=obj["vector"])
+                stats["indexed"] += len(buffer)
+            except Exception as e:
+                print(f"  Weaviate write error: {e}")
+            buffer = []
+
+        queue.task_done()
+
+    if buffer:
+        try:
+            with collection.batch.fixed_size(batch_size=len(buffer)) as batch:
+                for obj in buffer:
+                    batch.add_object(properties=obj["properties"], vector=obj["vector"])
+            stats["indexed"] += len(buffer)
+        except Exception as e:
+            print(f"  Weaviate flush error: {e}")
+
+
+def embed_chunk(gemini_client: genai.Client, texts: list[str], metas: list[dict], lang: str) -> list[dict]:
+    """Embed a chunk and return objects ready for Weaviate."""
+    valid = [(t, m) for t, m in zip(texts, metas) if t and t.strip()]
+    if not valid:
+        return []
+
+    valid_texts = [t[:8000] for t, _ in valid]
+    valid_metas = [m for _, m in valid]
+
+    vectors = embed_with_retry(gemini_client, valid_texts)
+    if not vectors:
+        return []
+
+    return [
+        {
+            "properties": {
+                "text": text,
+                "ref": meta.get("ref", ""),
+                "url": meta.get("url", ""),
+                "lang": lang,
+                "doc_category": meta.get("docCategory", ""),
+                "version_title": meta.get("versionTitle", ""),
+            },
+            "vector": vector,
+        }
+        for text, meta, vector in zip([t for t, _ in valid], valid_metas, vectors)
+    ]
 
 
 def ingest_dataset(
-    client: weaviate.WeaviateClient,
+    wv_client: weaviate.WeaviateClient,
     gemini_client: genai.Client,
     dataset_name: str,
     lang: str,
     limit: int | None = None,
+    start_from: int = 0,
 ) -> int:
     print(f"\nLoading {dataset_name}...")
     dataset = load_dataset(dataset_name, split="train")
     total = min(len(dataset), limit) if limit else len(dataset)
-    print(f"  {total:,} texts to index")
+    actual_total = total - start_from
+    print(f"  {actual_total:,} texts to index (from {start_from:,} to {total:,})")
 
-    collection = client.collections.get(COLLECTION_NAME)
-    indexed = 0
+    stats = {"indexed": 0}
+    queue: Queue = Queue(maxsize=50)
 
-    for start in range(0, total, BATCH_SIZE):
-        end = min(start + BATCH_SIZE, total)
+    writer = Thread(target=weaviate_writer, args=(wv_client, queue, stats), daemon=True)
+    writer.start()
+
+    start_time = time.time()
+
+    chunks = []
+    for start in range(start_from, total, EMBED_BATCH_SIZE):
+        end = min(start + EMBED_BATCH_SIZE, total)
         batch = dataset[start:end]
+        chunks.append((batch["text"], batch["metadata"], lang))
 
-        texts = batch["text"]
-        metadatas = batch["metadata"]
+    with ThreadPoolExecutor(max_workers=EMBED_WORKERS) as pool:
+        futures = {
+            pool.submit(embed_chunk, gemini_client, texts, metas, lng): i
+            for i, (texts, metas, lng) in enumerate(chunks)
+        }
 
-        # Skip empty texts
-        valid_indices = [i for i, t in enumerate(texts) if t and t.strip()]
-        if not valid_indices:
-            continue
+        done_count = 0
+        for future in as_completed(futures):
+            try:
+                objects = future.result()
+                if objects:
+                    queue.put(objects)
+            except Exception as e:
+                print(f"  Error: {e}")
 
-        valid_texts = [texts[i] for i in valid_indices]
-        valid_metas = [metadatas[i] for i in valid_indices]
+            done_count += 1
+            if done_count % 50 == 0:
+                elapsed = time.time() - start_time
+                rate = stats["indexed"] / elapsed if elapsed > 0 else 0
+                eta = (actual_total - stats["indexed"]) / rate / 3600 if rate > 0 else 0
+                print(f"  {stats['indexed']:,} / {actual_total:,} ({stats['indexed'] * 100 // max(actual_total, 1)}%) - {rate:.0f}/sec - ETA: {eta:.1f}h", flush=True)
 
-        # Truncate texts longer than 2048 tokens (~8000 chars) for embedding
-        truncated_texts = [t[:8000] for t in valid_texts]
+    queue.put(None)
+    writer.join()
 
-        try:
-            vectors = embed_batch(gemini_client, truncated_texts)
-        except Exception as e:
-            print(f"  Embedding error at batch {start}: {e}")
-            time.sleep(10)
-            continue
-
-        with collection.batch.fixed_size(batch_size=len(valid_texts)) as batch_writer:
-            for i, (text, meta, vector) in enumerate(zip(valid_texts, valid_metas, vectors)):
-                batch_writer.add_object(
-                    properties={
-                        "text": text,
-                        "ref": meta.get("ref", ""),
-                        "url": meta.get("url", ""),
-                        "lang": lang,
-                        "doc_category": meta.get("docCategory", ""),
-                        "version_title": meta.get("versionTitle", ""),
-                    },
-                    vector=vector,
-                )
-
-        indexed += len(valid_texts)
-
-        if start % (BATCH_SIZE * 10) == 0:
-            print(f"  {indexed:,} / {total:,} indexed ({indexed * 100 // total}%)")
-
-        time.sleep(PAUSE_BETWEEN_BATCHES)
-
-    print(f"  Done: {indexed:,} texts indexed for {lang}")
-    return indexed
+    print(f"  Done: {stats['indexed']:,} texts for {lang}")
+    return stats["indexed"]
 
 
 def main() -> None:
     limit = int(sys.argv[1]) if len(sys.argv) > 1 else None
+    start_from = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 
     if limit:
-        print(f"Running with limit: {limit:,} texts per dataset")
+        print(f"Limit: {limit:,} per dataset")
+    if start_from:
+        print(f"Starting from: {start_from:,}")
 
     wv_client = get_weaviate_client()
-    print(f"Connected to Weaviate: {wv_client.is_ready()}")
+    print(f"Connected: {wv_client.is_ready()}")
+
+    if wv_client.collections.exists(COLLECTION_NAME):
+        count = wv_client.collections.get(COLLECTION_NAME).aggregate.over_all(total_count=True)
+        print(f"Already indexed: {count.total_count:,}")
 
     gemini_client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
-
     create_collection(wv_client)
 
     total = 0
-    total += ingest_dataset(wv_client, gemini_client, "Sefaria/hebrew_library", "he", limit)
-    total += ingest_dataset(wv_client, gemini_client, "Sefaria/english_library", "en", limit)
+    # English only - cheaper and more accessible for beginners
+    total += ingest_dataset(wv_client, gemini_client, "Sefaria/english_library", "en", limit, start_from)
 
-    print(f"\nTotal indexed: {total:,} texts")
+    print(f"\nTotal new: {total:,}")
     wv_client.close()
 
 
