@@ -14,6 +14,7 @@ from google.genai import types
 COLLECTION_NAME = "SefariaTexts"
 
 RELEVANCE_THRESHOLD = 0.3  # Cohere rerank score below this = not relevant enough
+HYBRID_ALPHA = 0.5  # 0.0 = pure BM25 (keywords), 1.0 = pure vector (meaning), 0.5 = balanced
 
 SYSTEM_PROMPT = """You are a chavruta (Torah study partner), NOT a rabbi.
 
@@ -92,7 +93,7 @@ def get_weaviate_client() -> weaviate.WeaviateClient:
 
 
 def search(query: str, gemini_client: genai.Client, wv_client: weaviate.WeaviateClient, k: int = 20) -> list[Source]:
-    """Step 1: Embed query and search Weaviate for similar texts."""
+    """Step 1: Embed query and hybrid search Weaviate (vector + BM25 keywords)."""
     result = gemini_client.models.embed_content(
         model="gemini-embedding-001",
         contents=query,
@@ -100,8 +101,10 @@ def search(query: str, gemini_client: genai.Client, wv_client: weaviate.Weaviate
     query_vector = result.embeddings[0].values
 
     collection = wv_client.collections.get(COLLECTION_NAME)
-    results = collection.query.near_vector(
-        near_vector=query_vector,
+    results = collection.query.hybrid(
+        query=query,
+        vector=query_vector,
+        alpha=HYBRID_ALPHA,
         limit=k,
         return_properties=["text", "ref", "url", "lang", "doc_category"],
     )
