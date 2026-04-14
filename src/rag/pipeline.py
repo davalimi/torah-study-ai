@@ -1,4 +1,4 @@
-"""RAG pipeline: search Weaviate -> rerank with Cohere -> generate with Gemini."""
+"""RAG pipeline using LangChain: hybrid search -> Cohere rerank -> Gemini generation."""
 
 import base64
 import os
@@ -7,8 +7,9 @@ from dataclasses import dataclass
 
 import cohere
 import weaviate
-from google import genai
-from google.genai import types
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
 
 COLLECTION_NAME = "SefariaTexts"
@@ -92,74 +93,12 @@ def get_weaviate_client() -> weaviate.WeaviateClient:
     )
 
 
-def search(query: str, gemini_client: genai.Client, wv_client: weaviate.WeaviateClient, k: int = 20) -> list[Source]:
-    """Step 1: Embed query and hybrid search Weaviate (vector + BM25 keywords)."""
-    result = gemini_client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=query,
-    )
-    query_vector = result.embeddings[0].values
-
-    collection = wv_client.collections.get(COLLECTION_NAME)
-    results = collection.query.hybrid(
-        query=query,
-        vector=query_vector,
-        alpha=HYBRID_ALPHA,
-        limit=k,
-        return_properties=["text", "ref", "url", "lang", "doc_category"],
-    )
-
-    return [
-        Source(
-            ref=obj.properties["ref"],
-            url=obj.properties["url"],
-            text=obj.properties["text"],
-            lang=obj.properties["lang"],
-            category=obj.properties["doc_category"],
-            score=0.0,
-        )
-        for obj in results.objects
-    ]
-
-
-def rerank(query: str, sources: list[Source], cohere_client: cohere.Client, top_n: int = 5) -> list[Source]:
-    """Step 2: Rerank sources with Cohere for better relevance."""
-    if not sources:
-        return []
-
-    response = cohere_client.rerank(
-        model="rerank-english-v3.0",
-        query=query,
-        documents=[s.text for s in sources],
-        top_n=top_n,
-    )
-
-    return [
-        Source(
-            ref=sources[r.index].ref,
-            url=sources[r.index].url,
-            text=sources[r.index].text,
-            lang=sources[r.index].lang,
-            category=sources[r.index].category,
-            score=r.relevance_score,
-        )
-        for r in response.results
-    ]
-
-
 def build_context(sources: list[Source]) -> str:
     """Build context string from sources for the LLM prompt. No URLs - just ref and text."""
     parts = []
     for i, s in enumerate(sources, 1):
         parts.append(f"[Source {i}] {s.ref}\n{s.text}")
     return "\n\n".join(parts)
-
-
-def has_relevant_sources(ranked: list[Source]) -> bool:
-    """Check if the top reranked source is relevant enough."""
-    if not ranked:
-        return False
-    return ranked[0].score >= RELEVANCE_THRESHOLD
 
 
 def build_suggestions(sources: list[Source]) -> str:
@@ -173,71 +112,136 @@ def build_suggestions(sources: list[Source]) -> str:
     return "\n".join(suggestions)
 
 
-def _generate(
-    gemini_client: genai.Client,
-    system: str,
-    prompt: str,
-) -> str:
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        config=types.GenerateContentConfig(system_instruction=system),
-        contents=prompt,
-    )
-    return response.text
+class RAGPipeline:
+    """LangChain-based RAG pipeline: hybrid search -> rerank -> generate.
 
+    Components:
+    - GoogleGenerativeAIEmbeddings: embed queries for vector search
+    - ChatGoogleGenerativeAI: generate answers from sources
+    - CohereRerank: re-score retrieved documents
+    - LCEL chains: prompt | llm | parser
+    """
 
-def _stream(
-    gemini_client: genai.Client,
-    system: str,
-    prompt: str,
-) -> Generator[str, None, None]:
-    response = gemini_client.models.generate_content_stream(
-        model="gemini-2.5-flash",
-        config=types.GenerateContentConfig(system_instruction=system),
-        contents=prompt,
-    )
-    for chunk in response:
-        if chunk.text:
-            yield chunk.text
+    def __init__(self, wv_client: weaviate.WeaviateClient) -> None:
+        self.wv_client = wv_client
 
+        # 1. Embedding model (same model used to index the 94K texts)
+        self.embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+        )
 
-def ask_with_rag(
-    question: str,
-    gemini_client: genai.Client,
-    wv_client: weaviate.WeaviateClient,
-    cohere_client: cohere.Client,
-) -> str:
-    """Full RAG pipeline: search -> rerank -> generate."""
-    sources = search(question, gemini_client, wv_client, k=20)
-    ranked = rerank(question, sources, cohere_client, top_n=5)
+        # 2. LLM for generation
+        self.llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0,
+        )
 
-    if has_relevant_sources(ranked):
-        context = build_context(ranked)
-        prompt = f"Here are the relevant Torah sources:\n\n{context}\n\nQuestion: {question}"
-        return _generate(gemini_client, SYSTEM_PROMPT, prompt)
+        # 3. Cohere client for reranking (raw client for score access)
+        self.cohere_client = cohere.Client(
+            api_key=os.environ.get("COHERE_API_KEY", ""),
+        )
 
-    # Fallback: suggest related topics
-    suggestions = build_suggestions(sources)
-    system = FALLBACK_PROMPT.format(suggestions=suggestions)
-    return _generate(gemini_client, system, question)
+        # 4. Output parser (converts AIMessage to plain string)
+        self.parser = StrOutputParser()
 
+        # 5. LCEL chains: prompt | llm | parser
+        #    Each chain gets .invoke() and .stream() for free
+        self.rag_chain = (
+            ChatPromptTemplate.from_messages([
+                ("system", SYSTEM_PROMPT),
+                ("human", "Here are the relevant Torah sources:\n\n{context}\n\nQuestion: {question}"),
+            ])
+            | self.llm
+            | self.parser
+        )
 
-def stream_with_rag(
-    question: str,
-    gemini_client: genai.Client,
-    wv_client: weaviate.WeaviateClient,
-    cohere_client: cohere.Client,
-) -> Generator[str, None, None]:
-    """Full RAG pipeline with streaming: search -> rerank -> stream generation."""
-    sources = search(question, gemini_client, wv_client, k=20)
-    ranked = rerank(question, sources, cohere_client, top_n=5)
+        self.fallback_chain = (
+            ChatPromptTemplate.from_messages([
+                ("system", FALLBACK_PROMPT),
+                ("human", "{question}"),
+            ])
+            | self.llm
+            | self.parser
+        )
 
-    if has_relevant_sources(ranked):
-        context = build_context(ranked)
-        prompt = f"Here are the relevant Torah sources:\n\n{context}\n\nQuestion: {question}"
-        yield from _stream(gemini_client, SYSTEM_PROMPT, prompt)
-    else:
-        # Fallback: suggest related topics
-        suggestions = build_suggestions(sources)
-        system = FALLBACK_PROMPT.format(suggestions=suggestions)
-        yield from _stream(gemini_client, system, question)
+    def _retrieve_and_rerank(self, question: str) -> tuple[list[Source], bool]:
+        """Step 1+2: Hybrid search Weaviate -> Cohere rerank -> threshold check.
+
+        Returns (ranked_sources, is_relevant).
+        We use raw clients here because:
+        - langchain-weaviate doesn't fully support hybrid search
+        - We need Cohere scores for threshold gating
+        """
+        # Embed the question using LangChain's embedding model
+        query_vector = self.embeddings.embed_query(question)
+
+        # Hybrid search using raw Weaviate client
+        collection = self.wv_client.collections.get(COLLECTION_NAME)
+        results = collection.query.hybrid(
+            query=question,
+            vector=query_vector,
+            alpha=HYBRID_ALPHA,
+            limit=20,
+            return_properties=["text", "ref", "url", "lang", "doc_category"],
+        )
+
+        sources = [
+            Source(
+                ref=obj.properties["ref"],
+                url=obj.properties["url"],
+                text=obj.properties["text"],
+                lang=obj.properties["lang"],
+                category=obj.properties["doc_category"],
+                score=0.0,
+            )
+            for obj in results.objects
+        ]
+
+        if not sources:
+            return [], False
+
+        # Rerank with Cohere (raw client for score access)
+        response = self.cohere_client.rerank(
+            model="rerank-english-v3.0",
+            query=question,
+            documents=[s.text for s in sources],
+            top_n=5,
+        )
+
+        ranked = [
+            Source(
+                ref=sources[r.index].ref,
+                url=sources[r.index].url,
+                text=sources[r.index].text,
+                lang=sources[r.index].lang,
+                category=sources[r.index].category,
+                score=r.relevance_score,
+            )
+            for r in response.results
+        ]
+
+        return ranked, ranked[0].score >= RELEVANCE_THRESHOLD
+
+    def ask(self, question: str) -> str:
+        """Full RAG: search -> rerank -> generate (sync)."""
+        ranked, is_relevant = self._retrieve_and_rerank(question)
+
+        if is_relevant:
+            context = build_context(ranked)
+            return self.rag_chain.invoke({"context": context, "question": question})
+
+        suggestions = build_suggestions(ranked)
+        return self.fallback_chain.invoke({"suggestions": suggestions, "question": question})
+
+    def stream(self, question: str) -> Generator[str, None, None]:
+        """Full RAG: search -> rerank -> stream generation."""
+        ranked, is_relevant = self._retrieve_and_rerank(question)
+
+        if is_relevant:
+            context = build_context(ranked)
+            for chunk in self.rag_chain.stream({"context": context, "question": question}):
+                yield chunk
+        else:
+            suggestions = build_suggestions(ranked)
+            for chunk in self.fallback_chain.stream({"suggestions": suggestions, "question": question}):
+                yield chunk

@@ -5,15 +5,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import os
-import weaviate
-
-import cohere
-from google import genai
 
 from src.api.torah import ask_torah, stream_torah
 from src.api.db import init_db, get_connection
 from src.api.auth import hash_password, verify_password, create_token, get_current_user_id
-from src.rag.pipeline import get_weaviate_client, stream_with_rag
+from src.rag.pipeline import get_weaviate_client, RAGPipeline
 
 app = FastAPI(title="Torah Study AI")
 
@@ -24,27 +20,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Shared clients (initialized on startup)
-wv_client: weaviate.WeaviateClient | None = None
-gemini_client: genai.Client | None = None
-cohere_client: cohere.Client | None = None
+# Single RAG pipeline object (initialized on startup)
+rag_pipeline: RAGPipeline | None = None
 
 
 @app.on_event("startup")
 def startup() -> None:
-    global wv_client, gemini_client, cohere_client
+    global rag_pipeline
     init_db()
-
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    cohere_key = os.environ.get("COHERE_API_KEY")
-
-    if api_key:
-        gemini_client = genai.Client(api_key=api_key)
-    if cohere_key:
-        cohere_client = cohere.Client(api_key=cohere_key)
 
     try:
         wv_client = get_weaviate_client()
+        rag_pipeline = RAGPipeline(wv_client)
     except Exception:
         pass  # RAG not available, fallback to direct LLM
 
@@ -204,6 +191,10 @@ def chat(request_body: ChatRequest) -> ChatResponse:
     if not request_body.question.strip():
         raise HTTPException(status_code=400, detail="Please enter a question")
 
+    if rag_pipeline:
+        answer = rag_pipeline.ask(request_body.question)
+        return ChatResponse(answer=answer)
+
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="GOOGLE_API_KEY is not set")
@@ -220,15 +211,14 @@ def _sse_generator(question: str) -> Generator[str, None, None]:
     """SSE generator. Encodes chunks as JSON to preserve newlines."""
     import json
 
-    # Use RAG if all clients are available, otherwise fallback to direct LLM
-    if wv_client and gemini_client and cohere_client:
-        stream = stream_with_rag(question, gemini_client, wv_client, cohere_client)
+    # Use LangChain RAG pipeline if available, otherwise fallback to direct LLM
+    if rag_pipeline:
+        stream = rag_pipeline.stream(question)
     else:
         api_key = os.environ.get("GOOGLE_API_KEY", "")
         stream = stream_torah(question, api_key=api_key)
 
     for chunk in stream:
-        # JSON-encode to preserve newlines and special characters
         payload = json.dumps({"text": chunk})
         yield f"data: {payload}\n\n"
     yield "data: [DONE]\n\n"
@@ -236,7 +226,7 @@ def _sse_generator(question: str) -> Generator[str, None, None]:
 
 @app.post("/chat/stream")
 def chat_stream(request_body: ChatRequest) -> StreamingResponse:
-    if not gemini_client:
+    if not rag_pipeline and not os.environ.get("GOOGLE_API_KEY"):
         raise HTTPException(status_code=500, detail="GOOGLE_API_KEY is not set")
 
     if not request_body.question.strip():
